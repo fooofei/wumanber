@@ -1,4 +1,4 @@
-module github.com/fooofei/cpp_string_search/wumanber
+module github.com/fooofei/wumanber
 
 go 1.16
 
