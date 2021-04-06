@@ -16,6 +16,25 @@ func stringToBytes(ss []string) [][]byte {
 	return bb
 }
 
+func TestWuManber_One(t *testing.T) {
+	w, err := New(stringToBytes([]string{
+		"a",
+		"b",
+		"c",
+		"ef",
+	}))
+	assert.NilError(t, err)
+
+	hits := make([]int, 0)
+	w.Search([]byte("abcdefghcijefg"), func(needle []byte, needleIndex, textIndex int) bool {
+		hits = append(hits, textIndex)
+		return true
+	})
+
+	sort.Ints(hits)
+	assert.DeepEqual(t, hits, []int{0, 1, 2, 4, 8, 11})
+}
+
 func TestWuManber_Search(t *testing.T) {
 	w, err := New(stringToBytes([]string{
 		"abc",

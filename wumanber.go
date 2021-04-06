@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"math"
 )
 
@@ -31,6 +30,13 @@ func hashBlock2(s []byte, end int) uint32 {
 	return hashBlock(s[end-blockSize : end])
 }
 
+func toUint16(a, b byte) uint16 {
+	var c [2]byte
+	c[0] = a
+	c[1] = b
+	return binary.LittleEndian.Uint16(c[:])
+}
+
 type prefixHashPair struct {
 	PrefixHash uint32
 	Index      int
@@ -44,6 +50,9 @@ type WuManber struct {
 	tableSize         int
 	shiftTable        []int
 	prefixHashTable   []prefixHashItem
+	byteTable         [][]int // pattern length = 1
+	shortTable        [][]int // pattern length = 2
+
 }
 
 func getTableSize(patternCount int, patternMinSize int) int {
@@ -64,9 +73,60 @@ func min(a, b int) int {
 	return b
 }
 
+func getMinSubPatternSize(patterns [][]byte) int {
+	minSubPatternSize := math.MaxUint32
+	for _, p := range patterns {
+		if len(p) >= blockSize {
+			minSubPatternSize = min(minSubPatternSize, len(p))
+		}
+	}
+	return minSubPatternSize
+}
+
 func (w *WuManber) hashBlock(s []byte, end int) uint32 {
 	h := hashBlock2(s, end)
 	return h % uint32(w.tableSize)
+}
+
+func (w *WuManber) add1(c byte, index int) {
+	if w.byteTable == nil {
+		w.byteTable = make([][]int, 0x100)
+	}
+	w.byteTable[c] = append(w.byteTable[c], index)
+}
+
+func (w *WuManber) add2(c uint16, index int) {
+	if w.shortTable == nil {
+		w.shortTable = make([][]int, 0x100_00)
+	}
+	w.shortTable[c] = append(w.shortTable[c], index)
+}
+
+func (w *WuManber) add3(pattern []byte, index int) {
+	minSize := w.minSubPatternSize
+	// assert(blockSize <= len(pattern))
+	for j := minSize; j >= blockSize; j-- {
+		h := w.hashBlock(pattern, j)
+		w.shiftTable[h] = min(minSize-j, w.shiftTable[h])
+	}
+	// 等价与 for 循环的首次
+	h := w.hashBlock(pattern, minSize)
+	ph := w.hashBlock(pattern, blockSize)
+	w.prefixHashTable[h] = append(w.prefixHashTable[h], prefixHashPair{
+		PrefixHash: ph,
+		Index:      index,
+	})
+}
+
+func (w *WuManber) add(pattern []byte, index int) {
+	switch len(pattern) {
+	case 1:
+		w.add1(pattern[0], index)
+	case 2:
+		w.add2(toUint16(pattern[0], pattern[1]), index)
+	default:
+		w.add3(pattern, index)
+	}
 }
 
 func New(patterns [][]byte) (*WuManber, error) {
@@ -76,50 +136,68 @@ func New(patterns [][]byte) (*WuManber, error) {
 		return nil, errors.New("failed init, cannot work without patterns")
 	}
 
-	minSubPatternSize := math.MaxUint32
-
-	for _, p := range patterns {
-		if len(p) < blockSize {
-			// 简化处理，不支持小于 3 个字符的匹配
-			return nil, fmt.Errorf("pattern length cannot be small than blockSize %v", blockSize)
-		}
-		minSubPatternSize = min(minSubPatternSize, len(p))
-	}
+	minSubPatternSize := getMinSubPatternSize(patterns)
 
 	tableSize := getTableSize(patternCount, minSubPatternSize)
-	shiftTable := make([]int, tableSize)
-	for i := range shiftTable {
-		shiftTable[i] = minSubPatternSize - blockSize + 1
-	}
-	prefixHashTable := make([]prefixHashItem, tableSize)
 
+	w := &WuManber{
+		Patterns:          patterns,
+		minSubPatternSize: minSubPatternSize,
+		tableSize:         tableSize,
+		shiftTable:        make([]int, tableSize),
+		prefixHashTable:   make([]prefixHashItem, tableSize),
+		byteTable:         nil,
+		shortTable:        nil,
+	}
+	for i := range w.shiftTable {
+		w.shiftTable[i] = minSubPatternSize - blockSize + 1
+	}
 	for i := range patterns {
-		pattern := patterns[i]
-		// assert(blockSize <= len(pattern))
-		for j := minSubPatternSize; j >= blockSize; j-- {
-			h := hashBlock2(pattern, j) % uint32(tableSize)
-			shiftTable[h] = min(minSubPatternSize-j, shiftTable[h])
-		}
-		// 等价与 for 循环的首次
-		h := hashBlock2(pattern, minSubPatternSize) % uint32(tableSize)
-		ph := hashBlock2(pattern, blockSize) % uint32(tableSize)
-		prefixHashTable[h] = append(prefixHashTable[h], prefixHashPair{
-			PrefixHash: ph,
-			Index:      i,
-		})
+		w.add(patterns[i], i)
 	}
-
-	w := &WuManber{}
-	w.Patterns = make([][]byte, 0, patternCount)
-	w.Patterns = append(w.Patterns, patterns...)
-	w.minSubPatternSize = minSubPatternSize
-	w.tableSize = tableSize
-	w.shiftTable = shiftTable
-	w.prefixHashTable = prefixHashTable
 	return w, nil
 }
 
-func (w *WuManber) Search(text []byte, matchedCallback func(needle []byte, needleIndex, textIndex int) bool) {
+// 短字符性能特别差 不建议使用
+// return true for continue search others
+// false for break search
+func (w *WuManber) search1(text []byte, matchedCallback func(needle []byte, needleIndex, textIndex int) bool) bool {
+	if len(w.byteTable) == 0 {
+		return true
+	}
+	for i := range text {
+		c := text[i]
+		same := w.byteTable[c]
+		if len(same) > 0 {
+			for _, index := range same {
+				if !matchedCallback(w.Patterns[index], index, i) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (w *WuManber) search2(text []byte, matchedCallback func(needle []byte, needleIndex, textIndex int) bool) bool {
+	if len(w.shortTable) == 0 {
+		return true
+	}
+	for i := 0; i < len(text)-1; i++ {
+		c := toUint16(text[i], text[i+1])
+		same := w.shortTable[c]
+		if len(same) > 0 {
+			for _, index := range same {
+				if !matchedCallback(w.Patterns[index], index, i) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (w *WuManber) search3(text []byte, matchedCallback func(needle []byte, needleIndex, textIndex int) bool) {
 	i := w.minSubPatternSize
 loop:
 	for i <= len(text) {
@@ -143,5 +221,15 @@ loop:
 			shift = 1
 		}
 		i += shift
+	}
+}
+
+func (w *WuManber) Search(text []byte, matchedCallback func(needle []byte, needleIndex, textIndex int) bool) {
+	continueSearch := w.search1(text, matchedCallback)
+	if continueSearch {
+		continueSearch = w.search2(text, matchedCallback)
+	}
+	if continueSearch {
+		w.search3(text, matchedCallback)
 	}
 }
